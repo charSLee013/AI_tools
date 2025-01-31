@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Silicon Flow API配置
 SILICON_FLOW_API_URL = "https://api.siliconflow.cn/v1/chat/completions"
-MODEL_NAME = "deepseek-ai/DeepSeek-V3"
+MODEL_NAME = "Pro/Qwen/Qwen2.5-7B-Instruct"
 TRANLATE_SYSTEM_PROMPT = """你是一名专业的翻译官。你的任务是将用户输入的视频里面每句话都翻译成[中文]。如果遇到专业术语，请保持原样不变。确保翻译考虑到字幕的上下文，以准确传达原意。不要说对不起或者其他话语，也不要说抱歉和多余的其他话。可以结合下面的视频概要理解所要翻译的具体内容:
 {}
 """
@@ -57,7 +57,7 @@ def get_total_subs(srt_files: List[str]) -> Tuple[int, dict]:
             logging.error(f"跳过无效文件 {file}: {str(e)}")
     return total, valid_files
 
-def process_folder(folder: str, api_key: str, max_workers: int = 8):
+def process_folder(folder: str, api_key: str, file_workers: int = 4, sub_workers: int = 4):
     """处理整个文件夹，支持并发"""
     srt_files = find_srt_files(folder)
     logging.info(f"找到 {len(srt_files)} 个待处理字幕文件")
@@ -74,11 +74,11 @@ def process_folder(folder: str, api_key: str, max_workers: int = 8):
     # 创建共享的进度条和锁
     lock = threading.Lock()
     with tqdm(total=total_subs, desc="处理字幕条目", unit="条") as pbar:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=file_workers) as executor:
             futures = {
                 executor.submit(
                     process_single_file,
-                    (file, api_key, pbar, lock, valid_files[file])
+                    (file, api_key, pbar, lock, valid_files[file], sub_workers)
                 ): file
                 for file in valid_files
             }
@@ -105,7 +105,6 @@ def process_folder(folder: str, api_key: str, max_workers: int = 8):
     logging.info("=" * 50)
 
 def call_silicon_flow_api(api_key: str, messages: list, temperature: float = 0.7, max_retries: int = 3) -> str:
-    # 保持原有实现不变
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}"
@@ -133,7 +132,7 @@ def call_silicon_flow_api(api_key: str, messages: list, temperature: float = 0.7
         except requests.exceptions.RequestException as e:
             if attempt < max_retries:
                 logging.warning(f"API请求失败，尝试重试 ({attempt + 1}/{max_retries}): {str(e)}")
-                time.sleep(2 ** attempt)  # 指数退避
+                time.sleep(2 ** attempt)
             else:
                 logging.error(f"API请求失败，重试次数已用完: {str(e)}")
                 raise Exception(f"API请求失败: {str(e)}")
@@ -141,45 +140,55 @@ def call_silicon_flow_api(api_key: str, messages: list, temperature: float = 0.7
             logging.error("API响应格式异常")
             raise Exception("API响应格式异常")
 
-def translate_srt(input_file: str, output_file: str, summary_text: str, api_key: str, pbar: tqdm, lock: threading.Lock):
-    """翻译字幕文件并更新进度条"""
+def translate_srt(input_file: str, output_file: str, summary_text: str, api_key: str, pbar: tqdm, lock: threading.Lock, max_workers_per_file: int) -> int:
+    """翻译字幕文件并更新进度条（内部使用并发处理字幕条目）"""
     try:
         subs = pysrt.open(input_file, encoding='utf-8')
     except Exception as e:
         logging.error(f"无法打开文件 {input_file}: {str(e)}")
         raise
     
+    subs_list = list(subs)
     translated_subs = pysrt.SubRipFile()
     processed_count = 0
-    
-    for sub in subs:
+
+    def process_sub(sub, idx):
+        """处理单个字幕条目"""
         try:
             messages = [
                 {"role": "system", "content": TRANLATE_SYSTEM_PROMPT.format(summary_text)},
                 {"role": "user", "content": f"翻译以下字幕文本：\n{sub.text}"}
             ]
-            
-            translated_text = call_silicon_flow_api(
-                api_key=api_key,
-                messages=messages,
-                temperature=0.3
-            )
-            
-            translated_sub = pysrt.SubRipItem(
-                index=sub.index,
-                start=sub.start,
-                end=sub.end,
-                text=translated_text
-            )
-            translated_subs.append(translated_sub)
-            processed_count += 1
+            translated_text = call_silicon_flow_api(api_key, messages, temperature=0.3)
+            return (idx, translated_text.strip(), None)
         except Exception as e:
-            logging.error(f"翻译字幕失败: {sub.text}, 错误: {str(e)}")
-        finally:
-            # 无论成功与否都更新进度条
+            return (idx, None, e)
+
+    # 并发处理字幕条目
+    with ThreadPoolExecutor(max_workers=max_workers_per_file) as executor:
+        futures = [executor.submit(process_sub, sub, idx) for idx, sub in enumerate(subs_list)]
+        results = []
+        for future in as_completed(futures):
+            idx, translated_text, error = future.result()
             with lock:
                 pbar.update(1)
-    
+            if error:
+                logging.error(f"翻译失败: {subs_list[idx].text}, 错误: {str(error)}")
+            elif translated_text:
+                results.append((idx, translated_text))
+
+    # 按原始顺序排序并构建字幕
+    results.sort(key=lambda x: x[0])
+    for idx, translated_text in results:
+        original_sub = subs_list[idx]
+        translated_subs.append(pysrt.SubRipItem(
+            index=original_sub.index,
+            start=original_sub.start,
+            end=original_sub.end,
+            text=translated_text
+        ))
+        processed_count += 1
+
     try:
         translated_subs.save(output_file, encoding='utf-8')
         return processed_count
@@ -188,7 +197,6 @@ def translate_srt(input_file: str, output_file: str, summary_text: str, api_key:
         raise
 
 def summary_srt(input_file: str, api_key: str) -> str:
-    # 保持原有实现不变
     subs = pysrt.open(input_file, encoding='utf-8')
     full_text = "\n".join(sub.text for sub in subs)
     
@@ -197,15 +205,11 @@ def summary_srt(input_file: str, api_key: str) -> str:
         {"role": "user", "content": f"请根据以下字幕内容生成概要：\n{full_text}"}
     ]
     
-    return call_silicon_flow_api(
-        api_key=api_key,
-        messages=messages,
-        temperature=0.7
-    )
+    return call_silicon_flow_api(api_key, messages, temperature=0.7)
 
-def process_single_file(args: Tuple[str, str, tqdm, threading.Lock, int]) -> Tuple[str, float, int]:
+def process_single_file(args: Tuple[str, str, tqdm, threading.Lock, int, int]) -> Tuple[str, float, int]:
     """处理单个文件，返回处理结果、用时和处理的字幕数"""
-    input_path, api_key, pbar, lock, total_subs = args
+    input_path, api_key, pbar, lock, total_subs, sub_workers = args
     start_time = time.time()
     processed_count = 0
     
@@ -217,7 +221,7 @@ def process_single_file(args: Tuple[str, str, tqdm, threading.Lock, int]) -> Tup
             return (f"跳过已存在文件: {output_path}", 0, 0)
         
         summary = summary_srt(input_path, api_key)
-        processed_count = translate_srt(input_path, output_path, summary, api_key, pbar, lock)
+        processed_count = translate_srt(input_path, output_path, summary, api_key, pbar, lock, sub_workers)
         
         elapsed = time.time() - start_time
         return (f"成功生成: {os.path.basename(output_path)}", elapsed, processed_count)
@@ -226,7 +230,6 @@ def process_single_file(args: Tuple[str, str, tqdm, threading.Lock, int]) -> Tup
         return (f"处理失败: {input_path} ({str(e)})", elapsed, processed_count)
 
 def main():
-    # 保持原有实现不变
     parser = argparse.ArgumentParser(
         description="批量字幕翻译工具",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -237,10 +240,16 @@ def main():
         help="包含SRT字幕文件的文件夹路径"
     )
     parser.add_argument(
-        "--workers",
+        "--file-workers",
         type=int,
         default=4,
-        help="并发处理数"
+        help="并发处理的文件数"
+    )
+    parser.add_argument(
+        "--sub-workers",
+        type=int,
+        default=4,
+        help="每个文件内部处理字幕条目的并发数"
     )
     
     args = parser.parse_args()
@@ -256,7 +265,7 @@ def main():
         return
 
     try:
-        process_folder(args.folder, api_key, args.workers)
+        process_folder(args.folder, api_key, args.file_workers, args.sub_workers)
     except KeyboardInterrupt:
         logging.error("\n用户中断操作")
 
