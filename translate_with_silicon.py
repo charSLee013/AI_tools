@@ -242,7 +242,7 @@ def main():
     parser.add_argument(
         "--file-workers",
         type=int,
-        default=4,
+        default=1,
         help="并发处理的文件数"
     )
     parser.add_argument(
