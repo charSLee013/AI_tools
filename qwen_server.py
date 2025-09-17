@@ -366,7 +366,10 @@ async def pydantic_validation_exception_handler(request: Request, exc: Validatio
 
 class ChatMessage(BaseModel):
     role: str
-    content: Optional[str] = ""
+    content: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -480,42 +483,41 @@ def append_thinking_instruction(messages: List[ChatMessage]) -> None:
             break
 
 
-def normalize_messages(messages: List[ChatMessage]) -> List[Dict[str, str]]:
+def normalize_messages(messages: List[ChatMessage]) -> List[Dict[str, Any]]:
     """Ensure there's a system prompt and convert to dict format."""
-    normalized: List[Dict[str, str]] = []
+    normalized: List[Dict[str, Any]] = []
     has_system = any(msg.role.lower() == "system" for msg in messages)
     if not has_system:
         normalized.append({"role": "system", "content": "You are a helpful assistant."})
 
-    # Convert messages and validate tool message sequence
-    messages_dict = [{"role": msg.role.lower(), "content": msg.content or ""} for msg in messages]
+    # Convert messages to dict format, preserving all fields
+    for msg in messages:
+        message_dict = {"role": msg.role}
 
-    # Check for proper tool message ordering
-    valid_messages = []
-    for i, msg in enumerate(messages_dict):
-        if msg["role"] == "tool":
-            # Find the most recent non-tool assistant message before this one
-            found_assistant = False
-            for j in range(i-1, -1, -1):
-                if messages_dict[j]["role"] == "assistant":
-                    found_assistant = True
-                    break
-                elif messages_dict[j]["role"] != "tool":
-                    break
+        # Add content if present (can be None for assistant messages with tool_calls)
+        if msg.content is not None:
+            message_dict["content"] = msg.content
 
-            if not found_assistant:
-                logger.warning(f"Skipping tool message at position {i} with no preceding assistant message")
-                continue
+        # Add tool_calls if present (for assistant messages)
+        if msg.tool_calls is not None:
+            message_dict["tool_calls"] = msg.tool_calls
 
-        valid_messages.append(msg)
+        # Add tool_call_id if present (for tool messages)
+        if msg.tool_call_id is not None:
+            message_dict["tool_call_id"] = msg.tool_call_id
 
-    normalized.extend(valid_messages)
+        # Add name if present (for tool messages)
+        if msg.name is not None:
+            message_dict["name"] = msg.name
+
+        normalized.append(message_dict)
+
     return normalized
 
 
 
 def _run_completion_sync(
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     *,
     model: Optional[str],
     **all_params  # Accept all parameters transparently
@@ -596,7 +598,7 @@ def _run_completion_sync(
 
 
 async def run_completion(
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     *,
     model: Optional[str],
     **all_params  # Accept all parameters transparently
@@ -612,7 +614,7 @@ async def run_completion(
 
 
 def _stream_response_sync(
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     *,
     model: Optional[str],
     **all_params  # Accept all parameters transparently
@@ -704,7 +706,7 @@ def _stream_response_sync(
 
 
 async def stream_response(
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     *,
     model: Optional[str],
     **all_params  # Accept all parameters transparently
