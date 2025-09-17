@@ -228,6 +228,8 @@ class QwenSession:
                 if hasattr(delta, "model_dump"):
                     delta = delta.model_dump(exclude_none=True)
 
+
+
                 new_text = delta.get("content")
                 if new_text:
                     if new_text.startswith(full_content):
@@ -372,6 +374,8 @@ class ChatMessage(BaseModel):
     name: Optional[str] = None
 
 
+
+
 class ChatRequest(BaseModel):
     # Core required fields
     model: str
@@ -407,7 +411,7 @@ async def create_completion(request: ChatRequest, authorization: Optional[str] =
         logger.error("Empty messages array in request")
         raise HTTPException(status_code=400, detail="messages must not be empty")
 
-    messages = [ChatMessage(**msg.model_dump()) for msg in request.messages]
+    messages = request.messages
     if request.enable_thinking:
         append_thinking_instruction(messages)
 
